@@ -1,0 +1,118 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAS Enterprise — Local Development Stack
+#
+# Starts:
+#   - mas-gateway:     FastAPI gateway + LangGraph pipeline
+#   - dynamodb-local:  AWS DynamoDB local for DataFetcher testing
+#   - redis:           Rate limiter
+#   - keycloak:        On-prem identity provider (replaces Microsoft Entra ID)
+#   - prometheus:      Metrics scraper
+#   - grafana:         Metrics dashboard
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  mas-gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+      - "9090:9090"
+    environment:
+      ENV: development
+      LOG_LEVEL: DEBUG
+      LOG_FORMAT: console
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: localkey
+      AWS_SECRET_ACCESS_KEY: localsecret
+      DYNAMODB_ENDPOINT_URL: http://dynamodb-local:8000
+      DYNAMODB_PROFILES_TABLE: mas-user-profiles
+      DYNAMODB_TRANSACTIONS_TABLE: mas-transactions
+      REDIS_URL: redis://redis:6379
+      KEYCLOAK_JWKS_URI: http://keycloak:8080/realms/mas/protocol/openid-connect/certs
+      KEYCLOAK_TOKEN_URL: http://keycloak:8080/realms/mas/protocol/openid-connect/token
+      JWT_AUDIENCE: mas-enterprise
+      JWT_ISSUER: http://keycloak:8080/realms/mas
+      KMS_BACKEND: vault
+      VAULT_ADDR: http://vault:8200
+      VAULT_TOKEN: dev-root-token
+    depends_on:
+      - dynamodb-local
+      - redis
+      - keycloak
+    volumes:
+      - .:/app
+    networks:
+      - mas-net
+
+  dynamodb-local:
+    image: amazon/dynamodb-local:2.4.0
+    ports:
+      - "8001:8000"
+    command: "-jar DynamoDBLocal.jar -sharedDb -inMemory"
+    networks:
+      - mas-net
+
+  redis:
+    image: redis:7.2-alpine
+    ports:
+      - "6379:6379"
+    networks:
+      - mas-net
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:24.0.4
+    command: start-dev --import-realm
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./infra/keycloak/realm-export.json:/opt/keycloak/data/import/realm-export.json
+    networks:
+      - mas-net
+
+  vault:
+    image: hashicorp/vault:1.16.2
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: dev-root-token
+      VAULT_DEV_LISTEN_ADDRESS: "0.0.0.0:8200"
+    ports:
+      - "8200:8200"
+    cap_add:
+      - IPC_LOCK
+    networks:
+      - mas-net
+
+  prometheus:
+    image: prom/prometheus:v2.52.0
+    ports:
+      - "9091:9090"
+    volumes:
+      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+    networks:
+      - mas-net
+
+  grafana:
+    image: grafana/grafana:10.4.2
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    networks:
+      - mas-net
+
+volumes:
+  grafana-data:
+
+networks:
+  mas-net:
+    driver: bridge

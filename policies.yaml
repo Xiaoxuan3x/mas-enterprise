@@ -1,0 +1,41 @@
+# MAS Enterprise — Policy Definitions
+# Loaded by the Control Tower PolicyEngine at startup.
+# Edit and redeploy (or update SSM parameter) to change policies without code changes.
+
+policies:
+
+  - name: block_sanctioned_countries
+    type: deny_list
+    applies_to: ["*"]
+    conditions:
+      country_of_residence: ["IR", "KP", "SY", "CU", "RU"]
+    decision: deny
+    reason: "OFAC sanctioned country — transaction processing blocked by compliance policy"
+    enabled: true
+
+  - name: require_audit_critical_risk
+    type: audit_required
+    applies_to: ["*"]
+    conditions:
+      risk_level: "critical"
+    decision: allow_with_audit
+    reason: "Critical risk level mandates a human-review audit trail before action"
+    enabled: true
+
+  - name: require_audit_high_risk
+    type: audit_required
+    applies_to: ["*"]
+    conditions:
+      risk_level: "high"
+    decision: allow_with_audit
+    reason: "High risk level requires compliance sign-off within 24 hours"
+    enabled: true
+
+  - name: restrict_data_residency_eu
+    type: data_residency
+    applies_to: ["tenant_eu_*"]
+    conditions:
+      processing_region: ["us-east-1", "us-west-2"]
+    decision: deny
+    reason: "EU tenant data must be processed in EU regions per GDPR Article 46"
+    enabled: false      # Enable when EU region is provisioned
