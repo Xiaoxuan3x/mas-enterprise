@@ -186,7 +186,7 @@ class SupervisorInput(BaseModel):
     tenant_id: str
     fetched_data: FetchedData
     validation_result: ValidationResult
-    analysis_result: AnalysisResult
+    analysis_result: Optional[AnalysisResult] = None
 
 
 class StrategicRecommendation(BaseModel):

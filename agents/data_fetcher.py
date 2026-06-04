@@ -16,8 +16,17 @@ import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List
 
-import boto3
-from botocore.exceptions import BotoCoreError, ClientError
+try:
+    import boto3
+    from botocore.exceptions import BotoCoreError, ClientError
+except ImportError:  # pragma: no cover - used only in light local test envs
+    boto3 = None
+
+    class BotoCoreError(Exception):
+        """Fallback base exception when botocore is unavailable."""
+
+    class ClientError(Exception):
+        """Fallback client exception when botocore is unavailable."""
 
 from core.logging_config import agent_span, get_logger
 from core.retry import with_async_retry
@@ -50,6 +59,9 @@ def _build_dynamodb_client(region: str, endpoint_url: str | None = None) -> Any:
     Returns:
         A boto3 DynamoDB resource object.
     """
+    if boto3 is None:
+        raise RuntimeError("boto3 is not installed")
+
     kwargs: Dict[str, Any] = {"region_name": region}
     if endpoint_url:
         kwargs["endpoint_url"] = endpoint_url
@@ -118,18 +130,22 @@ def _fetch_transactions(
     Raises:
         ClientError: On DynamoDB access errors (retried by caller).
     """
-    from boto3.dynamodb.conditions import Attr, Key
-
     table = dynamodb.Table(table_name)
     since_iso = since.isoformat()
 
-    response = table.query(
-        KeyConditionExpression=Key("userId").eq(user_id)
-        & Key("timestamp").gt(since_iso),
-        FilterExpression=Attr("tenantId").eq(tenant_id),
-        ScanIndexForward=False,
-        Limit=500,
-    )
+    query_kwargs: Dict[str, Any] = {
+        "ScanIndexForward": False,
+        "Limit": 500,
+    }
+    if boto3 is not None:
+        from boto3.dynamodb.conditions import Attr, Key
+
+        query_kwargs["KeyConditionExpression"] = Key("userId").eq(user_id) & Key(
+            "timestamp"
+        ).gt(since_iso)
+        query_kwargs["FilterExpression"] = Attr("tenantId").eq(tenant_id)
+
+    response = table.query(**query_kwargs)
 
     transactions: List[Transaction] = []
     for item in response.get("Items", []):

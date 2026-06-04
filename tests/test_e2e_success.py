@@ -10,12 +10,57 @@ from __future__ import annotations
 import json
 import uuid
 from datetime import datetime, timezone
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
-from schemas.agent_io import AgentStatus, RiskLevel
-from schemas.state import initial_state
+from agents import analyst, data_fetcher, data_validator, email_agent, orchestrator, policy_gate, supervisor
+from schemas.agent_io import AgentStatus, EmailDeliveryReceipt
+
+
+def _merge_state(state, patch):
+    for key, value in patch.items():
+        if key in {"execution_history", "errors"}:
+            state[key] = [*state.get(key, []), *value]
+        elif key in {"execution_times", "token_usage", "metadata"}:
+            merged = dict(state.get(key, {}))
+            merged.update(value)
+            state[key] = merged
+        else:
+            state[key] = value
+    return state
+
+
+async def _run_pipeline(state):
+    _merge_state(state, await orchestrator.run(state))
+    _merge_state(state, await data_fetcher.run(state))
+    _merge_state(state, await data_validator.run(state))
+    _merge_state(state, await policy_gate.pre_analysis_run(state))
+
+    route = orchestrator.route_after_validation(state)
+    if route == "error_handler":
+        _merge_state(state, await orchestrator.error_handler(state))
+        return state
+
+    if route == "analyst":
+        _merge_state(state, await analyst.run(state))
+        _merge_state(state, await policy_gate.post_analysis_run(state))
+        if orchestrator.route_after_post_analysis_policy(state) == "error_handler":
+            _merge_state(state, await orchestrator.error_handler(state))
+            return state
+
+    _merge_state(state, await supervisor.run(state))
+
+    route = orchestrator.route_after_supervisor(state)
+    if route == "email_agent":
+        _merge_state(state, await email_agent.run(state))
+        route = orchestrator.route_after_email(state)
+
+    if route == "conversational_agent":
+        raise AssertionError("Conversational path is not expected in these e2e tests")
+
+    _merge_state(state, await orchestrator.finalize(state))
+    return state
 
 
 @pytest.mark.asyncio
@@ -106,34 +151,27 @@ async def test_full_pipeline_success(
         "model_id": "gemini-2.5-pro",
     }
 
-    mock_gemini_model = MagicMock()
-    mock_gemini_response = MagicMock()
-    mock_gemini_response.text = json.dumps(gemini_response_dict)
-    mock_gemini_response.candidates = [MagicMock()]
-    mock_gemini_response.usage_metadata = MagicMock(
-        prompt_token_count=450,
-        candidates_token_count=150,
-        total_token_count=600,
+    email_receipt = EmailDeliveryReceipt(
+        message_id="msg_e2e_001",
+        recipient_email="compliance@acme.com",
+        status="Submitted",
     )
-    mock_gemini_model.generate_content.return_value = mock_gemini_response
-
-    # ── Patch Azure email ─────────────────────────────────────────────────
-    mock_email_client = MagicMock()
-    mock_poller = MagicMock()
-    mock_poller.result.return_value = {"id": "msg_e2e_001", "status": "Submitted"}
-    mock_email_client.begin_send.return_value = mock_poller
 
     with (
-        patch("boto3.resource", return_value=mock_dynamodb),
+        patch("agents.data_fetcher._build_dynamodb_client", return_value=mock_dynamodb),
         patch(
-            "google.generativeai.GenerativeModel",
-            return_value=mock_gemini_model,
+            "agents.supervisor._invoke_gemini",
+            return_value=(
+                json.dumps(gemini_response_dict),
+                MagicMock(
+                    prompt_tokens=450,
+                    completion_tokens=150,
+                    total_tokens=600,
+                    model_id="gemini-2.5-pro",
+                ),
+            ),
         ),
-        patch("google.generativeai.configure"),
-        patch(
-            "azure.communication.email.EmailClient.from_connection_string",
-            return_value=mock_email_client,
-        ),
+        patch("agents.email_agent._send_via_azure", return_value=email_receipt),
         patch.dict(
             "os.environ",
             {
@@ -147,10 +185,7 @@ async def test_full_pipeline_success(
             },
         ),
     ):
-        from graph.workflow import build_workflow
-
-        graph = build_workflow()
-        final_state = await graph.ainvoke(base_state)
+        final_state = await _run_pipeline(base_state)
 
     final = final_state.get("final_response")
     assert final is not None, "Pipeline must produce a final_response"
@@ -162,6 +197,7 @@ async def test_full_pipeline_success(
     assert final.email_sent is True
     assert final.errors == []
     assert final.pipeline_duration_ms > 0
+    assert final_state["email_receipt"].recipient_email == "compliance@acme.com"
 
     # Verify execution history captured all agents
     history = final_state.get("execution_history", [])
@@ -243,21 +279,20 @@ async def test_data_validator_blocks_invalid_data(base_state):
         "model_id": "gemini-2.5-pro",
     }
 
-    mock_gemini_model = MagicMock()
-    mock_gemini_response = MagicMock()
-    mock_gemini_response.text = json.dumps(fallback_response)
-    mock_gemini_response.candidates = [MagicMock()]
-    mock_gemini_response.usage_metadata = MagicMock(
-        prompt_token_count=300,
-        candidates_token_count=100,
-        total_token_count=400,
-    )
-    mock_gemini_model.generate_content.return_value = mock_gemini_response
-
     with (
-        patch("boto3.resource", return_value=mock_dynamodb),
-        patch("google.generativeai.GenerativeModel", return_value=mock_gemini_model),
-        patch("google.generativeai.configure"),
+        patch("agents.data_fetcher._build_dynamodb_client", return_value=mock_dynamodb),
+        patch(
+            "agents.supervisor._invoke_gemini",
+            return_value=(
+                json.dumps(fallback_response),
+                MagicMock(
+                    prompt_tokens=300,
+                    completion_tokens=100,
+                    total_tokens=400,
+                    model_id="gemini-2.5-pro",
+                ),
+            ),
+        ),
         patch.dict(
             "os.environ",
             {
@@ -268,10 +303,7 @@ async def test_data_validator_blocks_invalid_data(base_state):
             },
         ),
     ):
-        from graph.workflow import build_workflow
-
-        graph = build_workflow()
-        final_state = await graph.ainvoke(base_state)
+        final_state = await _run_pipeline(base_state)
 
     final = final_state.get("final_response")
     assert final is not None
@@ -284,3 +316,5 @@ async def test_data_validator_blocks_invalid_data(base_state):
 
     # Pipeline should still complete (not crash)
     assert final.status in (AgentStatus.SUCCESS, AgentStatus.FAILURE)
+    assert final.email_sent is False
+    assert "email_agent" not in [h.agent_name for h in final_state.get("execution_history", [])]

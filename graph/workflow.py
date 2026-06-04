@@ -26,6 +26,7 @@ from typing import Any
 from langgraph.graph import END, StateGraph
 
 from agents import orchestrator, data_fetcher, data_validator, analyst, supervisor
+from agents import policy_gate
 from agents import email_agent, conversational_agent
 from schemas.state import MASState
 
@@ -51,7 +52,9 @@ def build_workflow() -> Any:
     graph.add_node("orchestrator", orchestrator.run)
     graph.add_node("data_fetcher", data_fetcher.run)
     graph.add_node("data_validator", data_validator.run)
+    graph.add_node("policy_gate_pre", policy_gate.pre_analysis_run)
     graph.add_node("analyst", analyst.run)
+    graph.add_node("policy_gate_post", policy_gate.post_analysis_run)
     graph.add_node("supervisor", supervisor.run)
     graph.add_node("email_agent", email_agent.run)
     graph.add_node("conversational_agent", conversational_agent.run)
@@ -64,14 +67,24 @@ def build_workflow() -> Any:
     # ── Deterministic edges ──────────────────────────────────────────────
     graph.add_edge("orchestrator", "data_fetcher")
     graph.add_edge("data_fetcher", "data_validator")
-    graph.add_edge("analyst", "supervisor")
+    graph.add_edge("data_validator", "policy_gate_pre")
+    graph.add_edge("analyst", "policy_gate_post")
 
     # ── Conditional edges ────────────────────────────────────────────────
     graph.add_conditional_edges(
-        "data_validator",
+        "policy_gate_pre",
         orchestrator.route_after_validation,
         {
             "analyst": "analyst",
+            "supervisor": "supervisor",
+            "error_handler": "error_handler",
+        },
+    )
+
+    graph.add_conditional_edges(
+        "policy_gate_post",
+        orchestrator.route_after_post_analysis_policy,
+        {
             "supervisor": "supervisor",
             "error_handler": "error_handler",
         },

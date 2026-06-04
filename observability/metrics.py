@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from prometheus_client import Counter, Gauge, Histogram, Info, make_asgi_app
 
+from schemas.agent_io import FinalResponse
+
 # ── Agent execution counters ──────────────────────────────────────────────────
 
 agent_executions_total = Counter(
@@ -109,6 +111,35 @@ def record_token_usage(
     llm_tokens_total.labels(
         agent_name=agent_name, token_type="completion", model_id=model_id
     ).inc(completion_tokens)
+
+
+def record_pipeline_result(final_response: FinalResponse, tenant_id: str) -> None:
+    """
+    Record the aggregated pipeline outcome in Prometheus.
+
+    Args:
+        final_response: Final pipeline response from the orchestrator.
+        tenant_id:      Tenant partition key for multi-tenant reporting.
+    """
+    pipeline_requests_total.labels(
+        tenant_id=tenant_id,
+        status=final_response.status.value,
+    ).inc()
+
+    if final_response.risk_level is not None:
+        pipeline_risk_level.labels(risk_level=final_response.risk_level.value).inc()
+
+    pipeline_duration_ms.observe(final_response.pipeline_duration_ms)
+
+
+def record_security_event(event_type: str) -> None:
+    """
+    Record a gateway or identity security event.
+
+    Args:
+        event_type: Event label such as ``jwt_rejected`` or ``policy_denied``.
+    """
+    security_events_total.labels(event_type=event_type).inc()
 
 
 # Mount this on a separate FastAPI app for Prometheus scraping

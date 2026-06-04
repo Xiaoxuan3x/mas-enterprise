@@ -18,6 +18,7 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
+from core.retry import with_async_retry
 from schemas.agent_io import (
     AgentError,
     AgentExecution,
@@ -341,6 +342,80 @@ def _enrich_explanation_via_bedrock(
 # ─────────────────────────────────────────────────────────────────────────────
 
 
+@with_async_retry(agent_name=AGENT_NAME)
+async def _run_analysis_with_retry(
+    fetched: FetchedData,
+    validation: Optional[ValidationResult],
+    use_bedrock: bool,
+    bedrock_model_id: str,
+    aws_region: str,
+) -> AnalysisResult:
+    """
+    Execute the deterministic analyst workflow with a retry boundary.
+
+    Args:
+        fetched:           Structured customer/profile/transaction data.
+        validation:        Optional validation result from the validator.
+        use_bedrock:       Whether narrative enrichment is enabled.
+        bedrock_model_id:  Bedrock model ID for optional explanation enrichment.
+        aws_region:        AWS region for optional Bedrock calls.
+
+    Returns:
+        Fully-populated ``AnalysisResult``.
+    """
+    kyc_status = fetched.profile.kyc_status
+    transactions = fetched.transactions
+    signals = [
+        _signal_velocity(transactions),
+        _signal_geo_anomaly(transactions),
+        _signal_night_transactions(transactions),
+        _signal_large_round_amounts(transactions),
+    ]
+
+    composite_score = _compute_composite_score(signals)
+    risk_level = _classify_risk(composite_score, kyc_status)
+    backtest_metrics = _run_backtest(transactions, composite_score)
+
+    if use_bedrock:
+        explanation = _enrich_explanation_via_bedrock(
+            risk_score=composite_score,
+            risk_level=risk_level,
+            signals=signals,
+            bedrock_model_id=bedrock_model_id,
+            aws_region=aws_region,
+        )
+    else:
+        explanation = (
+            f"Composite risk score {composite_score:.1f}/100 based on "
+            f"{len(signals)} weighted fraud signals across "
+            f"{len(transactions)} transactions."
+        )
+
+    requires_human = (
+        risk_level in (RiskLevel.HIGH, RiskLevel.CRITICAL)
+        or (validation is not None and not validation.is_valid)
+    )
+
+    recommended_action = {
+        RiskLevel.LOW: "No immediate action required. Proceed with standard monitoring.",
+        RiskLevel.MEDIUM: "Apply enhanced monitoring. Review within 5 business days.",
+        RiskLevel.HIGH: "Temporarily restrict account. Escalate to compliance team.",
+        RiskLevel.CRITICAL: "Immediate account suspension. Alert fraud operations centre.",
+    }[risk_level]
+
+    return AnalysisResult(
+        user_id=fetched.user_id,
+        composite_risk_score=composite_score,
+        risk_level=risk_level,
+        fraud_signals=signals,
+        backtest_metrics=backtest_metrics,
+        recommended_action=recommended_action,
+        requires_human_review=requires_human,
+        model_version=MODEL_VERSION,
+        explanation=explanation,
+    )
+
+
 async def run(state: MASState) -> Dict[str, Any]:
     """
     LangGraph node function for the Analyst agent.
@@ -368,66 +443,21 @@ async def run(state: MASState) -> Dict[str, Any]:
                 raise ValueError("fetched_data is required for Analyst")
 
             validation: Optional[ValidationResult] = state.get("validation_result")
-            kyc_status = fetched.profile.kyc_status
-
-            transactions = fetched.transactions
-            signals = [
-                _signal_velocity(transactions),
-                _signal_geo_anomaly(transactions),
-                _signal_night_transactions(transactions),
-                _signal_large_round_amounts(transactions),
-            ]
-
-            composite_score = _compute_composite_score(signals)
-            risk_level = _classify_risk(composite_score, kyc_status)
-            backtest_metrics = _run_backtest(transactions, composite_score)
-
             use_bedrock = os.environ.get("ANALYST_USE_BEDROCK", "false").lower() == "true"
-            if use_bedrock:
-                explanation = _enrich_explanation_via_bedrock(
-                    risk_score=composite_score,
-                    risk_level=risk_level,
-                    signals=signals,
-                    bedrock_model_id=os.environ.get(
-                        "BEDROCK_ANALYST_MODEL",
-                        "anthropic.claude-3-5-sonnet-20241022-v2:0",
-                    ),
-                    aws_region=os.environ.get("AWS_REGION", "us-east-1"),
-                )
-            else:
-                explanation = (
-                    f"Composite risk score {composite_score:.1f}/100 based on "
-                    f"{len(signals)} weighted fraud signals across "
-                    f"{len(transactions)} transactions."
-                )
-
-            requires_human = (
-                risk_level in (RiskLevel.HIGH, RiskLevel.CRITICAL)
-                or (validation is not None and not validation.is_valid)
-            )
-
-            recommended_action = {
-                RiskLevel.LOW: "No immediate action required. Proceed with standard monitoring.",
-                RiskLevel.MEDIUM: "Apply enhanced monitoring. Review within 5 business days.",
-                RiskLevel.HIGH: "Temporarily restrict account. Escalate to compliance team.",
-                RiskLevel.CRITICAL: "Immediate account suspension. Alert fraud operations centre.",
-            }[risk_level]
-
-            result = AnalysisResult(
-                user_id=fetched.user_id,
-                composite_risk_score=composite_score,
-                risk_level=risk_level,
-                fraud_signals=signals,
-                backtest_metrics=backtest_metrics,
-                recommended_action=recommended_action,
-                requires_human_review=requires_human,
-                model_version=MODEL_VERSION,
-                explanation=explanation,
+            result = await _run_analysis_with_retry(
+                fetched=fetched,
+                validation=validation,
+                use_bedrock=use_bedrock,
+                bedrock_model_id=os.environ.get(
+                    "BEDROCK_ANALYST_MODEL",
+                    "anthropic.claude-3-5-sonnet-20241022-v2:0",
+                ),
+                aws_region=os.environ.get("AWS_REGION", "us-east-1"),
             )
 
             duration_ms = (time.perf_counter() - start_time) * 1000
-            span["risk_level"] = risk_level.value
-            span["composite_score"] = composite_score
+            span["risk_level"] = result.risk_level.value
+            span["composite_score"] = result.composite_risk_score
 
             return {
                 "analysis_result": result,
@@ -441,8 +471,8 @@ async def run(state: MASState) -> Dict[str, Any]:
                         duration_ms=round(duration_ms, 2),
                         input_summary={"user_id": fetched.user_id},
                         output_summary={
-                            "risk_level": risk_level.value,
-                            "composite_score": composite_score,
+                            "risk_level": result.risk_level.value,
+                            "composite_score": result.composite_risk_score,
                         },
                         platform=PLATFORM,
                     )

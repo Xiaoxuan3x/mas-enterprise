@@ -17,7 +17,7 @@ import pytest
 
 from agents.supervisor import run as supervisor_run
 from core.guardrails import GuardrailViolation, ViolationCode, run_guardrails
-from schemas.agent_io import AgentStatus
+from schemas.agent_io import AgentStatus, TokenUsage
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -200,26 +200,24 @@ async def test_supervisor_activates_fallback_on_malformed_json(full_state):
     When Gemini returns non-JSON text, the supervisor node must parse the error,
     activate the fallback, and not raise an unhandled exception.
     """
-    mock_model = MagicMock()
-    mock_response = MagicMock()
-    mock_response.text = "I cannot process this request. <|end_of_turn|>"
-    mock_response.candidates = [MagicMock()]
-    mock_response.usage_metadata = MagicMock(
-        prompt_token_count=100, candidates_token_count=20, total_token_count=120
-    )
-    mock_model.generate_content.return_value = mock_response
-
-    with (
-        patch("google.generativeai.GenerativeModel", return_value=mock_model),
-        patch("google.generativeai.configure"),
-        patch.dict("os.environ", {"GEMINI_API_KEY": "test-key"}),
+    with patch(
+        "agents.supervisor._invoke_gemini",
+        return_value=(
+            "I cannot process this request. <|end_of_turn|>",
+            TokenUsage(
+                prompt_tokens=100,
+                completion_tokens=20,
+                total_tokens=120,
+                model_id="gemini-2.5-pro",
+            ),
+        ),
     ):
         result = await supervisor_run(full_state)
 
     output = result.get("supervisor_output")
     assert output is not None
     assert output.confidence_score == 0.0
-    assert "Manual review" in output.strategic_recommendations[0].action
+    assert "manual review" in output.strategic_recommendations[0].action.lower()
 
 
 @pytest.mark.asyncio
@@ -246,19 +244,17 @@ async def test_supervisor_activates_fallback_on_guardrail_violation(full_state):
         "model_id": "gemini-2.5-pro",
     }
 
-    mock_model = MagicMock()
-    mock_response = MagicMock()
-    mock_response.text = json.dumps(bad_output)
-    mock_response.candidates = [MagicMock()]
-    mock_response.usage_metadata = MagicMock(
-        prompt_token_count=200, candidates_token_count=50, total_token_count=250
-    )
-    mock_model.generate_content.return_value = mock_response
-
-    with (
-        patch("google.generativeai.GenerativeModel", return_value=mock_model),
-        patch("google.generativeai.configure"),
-        patch.dict("os.environ", {"GEMINI_API_KEY": "test-key"}),
+    with patch(
+        "agents.supervisor._invoke_gemini",
+        return_value=(
+            json.dumps(bad_output),
+            TokenUsage(
+                prompt_tokens=200,
+                completion_tokens=50,
+                total_tokens=250,
+                model_id="gemini-2.5-pro",
+            ),
+        ),
     ):
         result = await supervisor_run(full_state)
 

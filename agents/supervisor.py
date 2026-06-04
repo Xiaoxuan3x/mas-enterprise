@@ -98,10 +98,21 @@ def _build_user_prompt(supervisor_input: SupervisorInput, model_id: str) -> str:
     validation = supervisor_input.validation_result
     profile = supervisor_input.fetched_data.profile
 
-    signal_summary = ", ".join(
-        f"{s.signal_name}={s.score:.2f}"
-        for s in analysis.fraud_signals
-    )
+    if analysis is not None:
+        risk_analysis_block = f"""RISK ANALYSIS:
+- Composite risk score: {analysis.composite_risk_score:.1f}/100
+- Risk level: {analysis.risk_level.value.upper()}
+- Fraud signals: {", ".join(f"{s.signal_name}={s.score:.2f}" for s in analysis.fraud_signals)}
+- Recommended action: {analysis.recommended_action}
+- Requires human review: {analysis.requires_human_review}
+- Analyst explanation: {analysis.explanation}
+"""
+    else:
+        risk_analysis_block = """RISK ANALYSIS:
+- Automated scoring was skipped because the upstream data failed critical validation.
+- Produce a degraded summary focused on data quality issues and required manual review.
+- Do not infer a numeric risk score or precise risk level from incomplete data.
+"""
 
     return f"""Analyse the following risk assessment and produce the required JSON response.
 
@@ -112,13 +123,7 @@ USER CONTEXT:
 - Account age: {profile.account_age_days} days
 - Country: {profile.country_of_residence}
 
-RISK ANALYSIS:
-- Composite risk score: {analysis.composite_risk_score:.1f}/100
-- Risk level: {analysis.risk_level.value.upper()}
-- Fraud signals: {signal_summary}
-- Recommended action: {analysis.recommended_action}
-- Requires human review: {analysis.requires_human_review}
-- Analyst explanation: {analysis.explanation}
+{risk_analysis_block}
 
 VALIDATION:
 - Data valid: {validation.is_valid}
@@ -264,9 +269,9 @@ async def run(state: MASState) -> Dict[str, Any]:
             validation: Optional[ValidationResult] = state.get("validation_result")
             analysis: Optional[AnalysisResult] = state.get("analysis_result")
 
-            if not all([fetched, validation, analysis]):
+            if fetched is None or validation is None:
                 raise ValueError(
-                    "Supervisor requires fetched_data, validation_result, and analysis_result"
+                    "Supervisor requires fetched_data and validation_result"
                 )
 
             supervisor_input = SupervisorInput(

@@ -18,6 +18,7 @@ import os
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
+from urllib.parse import unquote
 
 from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -25,9 +26,18 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from core.logging_config import configure_logging, get_logger
-from core.security import JWTValidationError, validate_jwt
+from core.security import JWTValidationError, extract_mtls_fingerprint, validate_jwt
+from control_tower.policy_engine import PolicyViolation, policy_engine
 from gateway.pii_obfuscator import obfuscate_payload
 from gateway.prompt_injection_guard import PromptInjectionError, enforce_no_injection
+from observability.metrics import (
+    record_agent_execution,
+    record_pipeline_result,
+    record_security_event,
+    record_token_usage,
+)
+from observability.observe_client import observe
+from schemas.agent_io import AgentExecution, FinalResponse, TokenUsage
 from schemas.state import initial_state
 
 configure_logging(
@@ -137,6 +147,7 @@ async def _check_rate_limit(tenant_id: str, request_id: str) -> None:
                 request_id=request_id,
                 count=count,
             )
+            record_security_event("rate_limit_exceeded")
             raise HTTPException(
                 status_code=status.HTTP_429_TOO_MANY_REQUESTS,
                 detail="Rate limit exceeded. Retry after 60 seconds.",
@@ -146,6 +157,68 @@ async def _check_rate_limit(tenant_id: str, request_id: str) -> None:
     except Exception as exc:
         # Redis unavailable — fail open with a warning (availability > strict limiting)
         logger.warning("gateway.rate_limit_redis_error", error=str(exc))
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    """Read a conventional boolean environment variable."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _build_request_policy_context(body: AnalyseRequest) -> Dict[str, Any]:
+    """Build policy context available before the graph runs."""
+    return {
+        "processing_region": os.environ.get("AWS_REGION", "us-east-1"),
+        "send_email": body.send_email,
+        "language_code": body.language_code,
+        "fetch_types": body.fetch_types,
+    }
+
+
+def _emit_observability(
+    *,
+    request_id: str,
+    tenant_id: str,
+    final_state: Dict[str, Any],
+    final_response: FinalResponse,
+) -> None:
+    """
+    Emit Observe events and Prometheus metrics for a completed request.
+
+    Observability is best-effort only. Failures are logged and ignored so they
+    cannot block the business pipeline.
+    """
+    try:
+        for execution in final_state.get("execution_history", []):
+            if isinstance(execution, AgentExecution):
+                observe.emit_agent_execution(execution, request_id, tenant_id)
+                record_agent_execution(
+                    agent_name=execution.agent_name,
+                    status=execution.status.value,
+                    platform=execution.platform,
+                    duration_seconds=execution.duration_ms / 1000,
+                )
+
+        for agent_name, usage in final_state.get("token_usage", {}).items():
+            if isinstance(usage, TokenUsage):
+                observe.emit_token_usage(agent_name, usage, request_id, tenant_id)
+                record_token_usage(
+                    agent_name=agent_name,
+                    model_id=usage.model_id,
+                    prompt_tokens=usage.prompt_tokens,
+                    completion_tokens=usage.completion_tokens,
+                )
+
+        observe.emit_pipeline_result(final_response, tenant_id)
+        record_pipeline_result(final_response, tenant_id)
+    except Exception as exc:
+        logger.warning(
+            "gateway.observability_emit_failed",
+            request_id=request_id,
+            error=str(exc),
+        )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -187,6 +260,7 @@ async def analyse(request: Request, body: AnalyseRequest) -> AnalyseResponse:
     # ── JWT validation ────────────────────────────────────────────────────
     auth_header = request.headers.get("Authorization", "")
     if not auth_header.startswith("Bearer "):
+        record_security_event("jwt_missing_or_malformed")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Missing or malformed Authorization header",
@@ -209,10 +283,31 @@ async def analyse(request: Request, body: AnalyseRequest) -> AnalyseResponse:
         )
     except JWTValidationError as exc:
         logger.warning("gateway.auth_failed", request_id=request_id, reason=str(exc))
+        record_security_event("jwt_rejected")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Authentication failed",
         )
+
+    # ── mTLS binding ──────────────────────────────────────────────────────
+    client_cert_header = request.headers.get("X-Client-Cert", "")
+    if _env_flag("REQUIRE_MTLS", default=False) and not client_cert_header:
+        record_security_event("mtls_missing")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Client certificate is required",
+        )
+    if client_cert_header:
+        try:
+            pem_cert = unquote(client_cert_header).encode()
+            security_ctx.mtls_fingerprint = extract_mtls_fingerprint(pem_cert)
+        except Exception as exc:
+            logger.warning("gateway.mtls_failed", request_id=request_id, reason=str(exc))
+            record_security_event("mtls_invalid")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Invalid client certificate",
+            )
 
     # ── Rate limiting ─────────────────────────────────────────────────────
     await _check_rate_limit(body.tenant_id, request_id)
@@ -222,6 +317,7 @@ async def analyse(request: Request, body: AnalyseRequest) -> AnalyseResponse:
     try:
         enforce_no_injection(raw_payload, request_id)
     except PromptInjectionError as exc:
+        record_security_event("prompt_injection_detected")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Request blocked: prompt injection detected ({len(exc.matches)} pattern(s))",
@@ -229,6 +325,27 @@ async def analyse(request: Request, body: AnalyseRequest) -> AnalyseResponse:
 
     # ── PII obfuscation ───────────────────────────────────────────────────
     clean_payload = obfuscate_payload(raw_payload)
+
+    # ── Request-time policy enforcement ───────────────────────────────────
+    try:
+        request_policy = policy_engine.evaluate(
+            operation="analyse",
+            tenant_id=body.tenant_id,
+            user_id=body.user_id,
+            context=_build_request_policy_context(body),
+        )
+    except PolicyViolation as exc:
+        logger.warning(
+            "gateway.policy_denied",
+            request_id=request_id,
+            policy_name=exc.policy_name,
+            reason=exc.reason,
+        )
+        record_security_event("policy_denied")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=exc.reason,
+        )
 
     # ── State initialisation ──────────────────────────────────────────────
     session_id = request.headers.get("X-Session-ID") or str(uuid.uuid4())
@@ -241,12 +358,26 @@ async def analyse(request: Request, body: AnalyseRequest) -> AnalyseResponse:
         security_context=security_ctx,
         timestamp=datetime.now(timezone.utc).isoformat(),
     )
+    state["metadata"] = {
+        "notification_email": body.notification_email,
+        "notification_name": body.notification_name,
+        "policy_name": request_policy.policy_name,
+        "policy_reason": request_policy.reason,
+        "policy_requires_audit": request_policy.requires_audit,
+    }
 
     # ── Pipeline invocation ───────────────────────────────────────────────
     try:
         from graph.workflow import compiled_graph
 
         final_state = await compiled_graph.ainvoke(state)
+        metadata = final_state.get("metadata", {})
+        if metadata.get("policy_denied"):
+            record_security_event("policy_denied")
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail=metadata.get("policy_reason", "Request denied by policy"),
+            )
         final_response = final_state.get("final_response")
 
         if final_response is None:
@@ -257,6 +388,12 @@ async def analyse(request: Request, body: AnalyseRequest) -> AnalyseResponse:
             request_id=request_id,
             status=final_response.status.value,
             duration_ms=final_response.pipeline_duration_ms,
+        )
+        _emit_observability(
+            request_id=request_id,
+            tenant_id=body.tenant_id,
+            final_state=final_state,
+            final_response=final_response,
         )
 
         return AnalyseResponse(

@@ -46,6 +46,14 @@ HTTP Request
 │  Output: ValidationResult  →  state.validation_result        │
 └──────────────────────────┬──────────────────────────────────┘
                            │
+                           ▼
+┌─────────────────────────────────────────────────────────────┐
+│  POLICY GATE (On-Prem — Control Tower checkpoint)            │
+│  • Evaluates tenant / request / fetched-data policies        │
+│  • Can deny before analysis or require audit metadata        │
+│  Output: state.metadata policy flags                         │
+└──────────────────────────┬──────────────────────────────────┘
+                           │
                     ┌──────▼──────────────┐
                     │  route_after_        │
                     │  validation()        │
@@ -58,19 +66,29 @@ HTTP Request
           │ (AWS)      │    │  (On-Prem)   │   └───────────────┘
           └─────┬──────┘    └──────┬───────┘
                 │ analysis_result  │ supervisor_output
-                └──────────────────┘
+                ▼
+┌─────────────────────────────────────────────────────────────┐
+│  POLICY GATE (On-Prem — post-analysis checkpoint)           │
+│  • Evaluates analysis-dependent policies (e.g. risk gates)  │
+│  • Can deny before supervisor/email side effects            │
+└──────────────────────────┬──────────────────────────────────┘
+                           │
+                           └──────────────────┐
+                                              ▼
                            │
                            ▼
 ┌─────────────────────────────────────────────────────────────┐
 │  SUPERVISOR (On-Prem — Non-Deterministic Agent C)            │
 │  Model: Gemini 2.5 Pro (NVIDIA AI Enterprise / on-prem NIM) │
-│  • Builds structured prompt from FetchedData+Analysis        │
+│  • Builds structured prompt from validated data and optional │
+│    analysis output                                           │
 │  • Calls Gemini with response_mime_type="application/json"   │
 │  • Runs GUARDRAIL pipeline:                                  │
 │    1. Schema validation (Pydantic)                           │
 │    2. Structural checks (summary length, rec count)          │
 │    3. Forbidden token scan (PAN regex, injection patterns)   │
 │  • On failure: activates graceful degradation fallback       │
+│  • Handles upstream degraded paths when analyst is skipped   │
 │  • Manages state: token_usage, execution_history appended    │
 │  Output: SupervisorOutput  →  state.supervisor_output        │
 └──────────────────────────┬──────────────────────────────────┘
@@ -112,6 +130,7 @@ HTTP Request
 | Orchestrator | Coordinator | On-Prem | None | MASState | Routing decisions |
 | DataFetcher | Deterministic A | AWS | None | user_id, tenant_id | FetchedData |
 | DataValidator | Deterministic B | On-Prem | Optional SLM | FetchedData | ValidationResult |
+| PolicyGate | Deterministic Control | On-Prem | None | request/fetched/analysis context | allow/deny/audit metadata |
 | Analyst | Deterministic A | AWS | Optional Bedrock | FetchedData+Validation | AnalysisResult |
 | Supervisor | Non-Deterministic C | On-Prem | Gemini 2.5 Pro | All above | SupervisorOutput |
 | Email Agent | Copilot | Azure | None (template) | SupervisorOutput | EmailDeliveryReceipt |
@@ -127,6 +146,7 @@ State field          Set by              Read by
 fetched_data         DataFetcher         DataValidator, Analyst, Supervisor
 validation_result    DataValidator       Orchestrator (routing), Analyst, Supervisor
 analysis_result      Analyst             Supervisor, EmailAgent, FinalizeNode
+metadata             Gateway/PolicyGate  Routing, policy audit, operational fields
 supervisor_output    Supervisor          EmailAgent, ConversationalAgent, FinalizeNode
 email_receipt        EmailAgent          FinalizeNode
 conversational_resp  ConversationalAgent FinalizeNode
@@ -147,6 +167,7 @@ security_context     Gateway             All agents (authorisation checks)
 │  ON-PREMISES  (NVIDIA B200/B300 GPU cluster)                   │
 │  • Orchestrator (CPU)                                          │
 │  • DataValidator (CPU — rule engine)                           │
+│  • PolicyGate (CPU — control tower checkpoint)                 │
 │  • Supervisor (GPU — Gemini 2.5 Pro via NVIDIA NIM)            │
 │  • Keycloak Identity Server (replaces Microsoft Entra ID)      │
 │  • HashiCorp Vault (KMS for on-prem agents)                    │
@@ -174,7 +195,7 @@ security_context     Gateway             All agents (authorisation checks)
 ┌────────────────────────────────────────────────────────────────┐
 │  GCP                                                           │
 │  • Conversational Agent (Dialogflow CX)                        │
-│  • Gemini fallback (Vertex AI Generative Models API)           │
+│  • Gemini-backed supervision and fallback reasoning            │
 │  • Cloud Logging (conversation audit)                          │
 └────────────────────────────────────────────────────────────────┘
 ```
@@ -240,4 +261,8 @@ Pipeline result  →  Observe event (risk_level, duration, email_sent)
 
 Security events  →  structlog WARNING
                  →  Prometheus counter (mas_security_events_total{event_type})
+
+Execution history and token usage are emitted from the gateway after graph
+completion using the accumulated centralized state, preserving traceability
+across deterministic and non-deterministic agent transitions.
 ```

@@ -236,11 +236,16 @@ async def run(state: MASState) -> Dict[str, Any]:
                     "Email agent requires supervisor_output and analysis_result"
                 )
 
-            recipient_email = state["raw_input"].get(
-                "notification_email",
-                state["metadata"].get("user_email", "compliance@mas-enterprise.com"),
+            recipient_email = (
+                state["metadata"].get("notification_email")
+                or state["raw_input"].get("notification_email")
+                or state["metadata"].get("user_email", "compliance@mas-enterprise.com")
             )
-            recipient_name = state["raw_input"].get("notification_name", "Compliance Team")
+            recipient_name = (
+                state["metadata"].get("notification_name")
+                or state["raw_input"].get("notification_name")
+                or "Compliance Team"
+            )
 
             priority = (
                 EmailPriority.HIGH

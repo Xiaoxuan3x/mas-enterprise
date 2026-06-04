@@ -53,6 +53,15 @@ def route_after_validation(
     Returns:
         Node name string for the next LangGraph edge.
     """
+    if state.get("metadata", {}).get("policy_denied"):
+        logger.warning(
+            "orchestrator.route",
+            decision="error_handler",
+            reason="policy_denied",
+            policy_name=state.get("metadata", {}).get("policy_name"),
+        )
+        return "error_handler"
+
     if state.get("fetched_data") is None:
         logger.warning("orchestrator.route", decision="error_handler", reason="no_fetched_data")
         return "error_handler"
@@ -75,6 +84,21 @@ def route_after_validation(
     return "analyst"
 
 
+def route_after_post_analysis_policy(
+    state: MASState,
+) -> Literal["supervisor", "error_handler"]:
+    """Route to the supervisor unless a policy gate denied the request."""
+    if state.get("metadata", {}).get("policy_denied"):
+        logger.warning(
+            "orchestrator.route",
+            decision="error_handler",
+            reason="policy_denied_post_analysis",
+            policy_name=state.get("metadata", {}).get("policy_name"),
+        )
+        return "error_handler"
+    return "supervisor"
+
+
 def route_after_supervisor(
     state: MASState,
 ) -> Literal["email_agent", "conversational_agent", "finalize"]:
@@ -94,9 +118,18 @@ def route_after_supervisor(
     """
     raw = state.get("raw_input", {})
 
-    if raw.get("send_email", False) or raw.get("notification_email"):
+    wants_email = raw.get("send_email", False) or bool(
+        state.get("metadata", {}).get("notification_email") or raw.get("notification_email")
+    )
+    if wants_email and state.get("analysis_result") is not None:
         logger.info("orchestrator.route", decision="email_agent")
         return "email_agent"
+    if wants_email:
+        logger.warning(
+            "orchestrator.route",
+            decision="skip_email",
+            reason="missing_analysis_result",
+        )
 
     if raw.get("utterance"):
         logger.info("orchestrator.route", decision="conversational_agent")

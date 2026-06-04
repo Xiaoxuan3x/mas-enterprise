@@ -3,6 +3,69 @@
 Production-ready Multi-Agent System built with **LangGraph**, **Python 3.11**,
 and a hybrid on-prem / multi-cloud architecture.
 
+## High-Level Architecture
+
+This repository implements a hybrid **Python + LangGraph** Multi-Agent System
+with an **on-prem Orchestrator**, multiple **deterministic sub-agents**, and one
+primary **non-deterministic LLM-backed supervisor**.
+
+```text
+Client Request
+  -> Gateway / Ingress
+  -> On-Prem Orchestrator
+  -> Deterministic Agents
+     - DataFetcher
+     - DataValidator
+     - Analyst
+  -> Non-Deterministic Agent
+     - Supervisor (Gemini-backed)
+  -> Optional Sidecar Agents
+     - Email Agent
+     - Conversational Agent
+  -> Final Response
+```
+
+Current platform split in this repo:
+
+- On-prem: Orchestrator, policy gates, validation, supervisor, identity/security controls
+- AWS: Gateway hosting assumptions, DynamoDB-backed fetching, analyst enrichment path
+- GCP / Google: Gemini model usage and Dialogflow conversational path
+- Azure: Notification email delivery
+
+This means the repository **does achieve** the core MAS shape:
+
+- Python implementation
+- LangGraph-based coordination
+- deterministic and non-deterministic agent mix
+- central on-prem Orchestrator
+- hybrid deployment model
+
+The repo is therefore best described as a **hybrid enterprise MAS with
+Google-led AI services**, not a fully Google-centric infrastructure stack.
+
+## Requirement Coverage
+
+### Architecture and Roles
+
+- `A.1 Central Orchestrator`: [agents/orchestrator.py](/Users/trix/dev/mas-enterprise/agents/orchestrator.py) manages state, routing, finalization, and failure handling.
+- `A.2 Non-Deterministic Agent C (Supervisor)`: [agents/supervisor.py](/Users/trix/dev/mas-enterprise/agents/supervisor.py) is Gemini-backed, handles graceful degradation, and aggregates natural-language output.
+- `A.3 Deterministic Agent B (DataValidator)`: [agents/data_validator.py](/Users/trix/dev/mas-enterprise/agents/data_validator.py) uses schema checks, regex, and math/business rules.
+- `A.4 Deterministic Agent A (DataFetcher)`: [agents/data_fetcher.py](/Users/trix/dev/mas-enterprise/agents/data_fetcher.py) performs code-only structured data retrieval.
+- `A.5 Deterministic Agent A (Analyst)`: [agents/analyst.py](/Users/trix/dev/mas-enterprise/agents/analyst.py) performs risk scoring, fraud analysis, backtesting, and optional LLM-assisted explanation enrichment.
+- `A.6 Email Agent`: [agents/email_agent.py](/Users/trix/dev/mas-enterprise/agents/email_agent.py) sends notifications through Azure Communication Services.
+- `A.7 Conversational Agent`: [agents/conversational_agent.py](/Users/trix/dev/mas-enterprise/agents/conversational_agent.py) runs on the GCP/Dialogflow path and integrates with Salesforce.
+- `A.8 Other Considerations`: gateway defense, tokenisation utilities, key management, policy control tower, and zero-trust identity are implemented across [gateway/](/Users/trix/dev/mas-enterprise/gateway), [security/](/Users/trix/dev/mas-enterprise/security), and [control_tower/](/Users/trix/dev/mas-enterprise/control_tower).
+
+### Enterprise Controls
+
+- `B.1 State Management`: centralized `MASState` with append-only execution/error reducers in [schemas/state.py](/Users/trix/dev/mas-enterprise/schemas/state.py).
+- `B.2 Type Safety & Validation`: strict Pydantic contracts in [schemas/agent_io.py](/Users/trix/dev/mas-enterprise/schemas/agent_io.py).
+- `B.3 Error Handling & Fallbacks`: deterministic retry helpers in [core/retry.py](/Users/trix/dev/mas-enterprise/core/retry.py), deterministic retries in fetch/email/analyst paths, and supervisor graceful fallback on LLM failure.
+- `B.4 Guardrails`: supervisor output guardrails in [core/guardrails.py](/Users/trix/dev/mas-enterprise/core/guardrails.py).
+- `B.5 Logging & Observability`: structured JSON logs, Observe emission, and Prometheus metrics in [core/logging_config.py](/Users/trix/dev/mas-enterprise/core/logging_config.py) and [observability/](/Users/trix/dev/mas-enterprise/observability).
+- `B.6 Control Tower`: per-request policy evaluation and centralized config in [control_tower/](/Users/trix/dev/mas-enterprise/control_tower).
+- `B.7 Security`: JWT validation, optional mTLS enforcement, HMAC signing, tokenisation helpers, and KMS/Vault-backed key management in [core/security.py](/Users/trix/dev/mas-enterprise/core/security.py) and [security/](/Users/trix/dev/mas-enterprise/security).
+
 ## Quick Start
 
 ### 1. Prerequisites
@@ -73,6 +136,11 @@ pytest tests/ -v
 pytest tests/ -v --cov=. --cov-report=term-missing
 ```
 
+These tests are mostly mocked:
+
+- no real DynamoDB, Gemini, or Azure calls are required
+- the suite validates your pipeline logic and guardrail behavior, not live cloud services
+
 ---
 
 ## Project Structure
@@ -88,6 +156,7 @@ mas-enterprise/
 │   ├── data_fetcher.py             # AWS DynamoDB data retrieval (Deterministic A)
 │   ├── data_validator.py           # Rule-based validation engine (Deterministic B)
 │   ├── analyst.py                  # Fraud scoring + backtesting (Deterministic A)
+│   ├── policy_gate.py              # Control Tower policy checkpoints in the graph
 │   ├── supervisor.py               # Gemini LLM summary + recs (Non-Deterministic C)
 │   ├── email_agent.py              # Azure Communication Services email
 │   └── conversational_agent.py     # GCP Dialogflow CX + Gemini fallback
@@ -137,10 +206,12 @@ mas-enterprise/
 | Orchestrator | On-Prem | CPU | LangGraph routing node |
 | DataFetcher | AWS | ECS/Lambda | DynamoDB via boto3 |
 | DataValidator | On-Prem | CPU | Rule engine — no LLM |
-| Analyst | AWS | ECS + Bedrock | Optional Claude enrichment |
+| Analyst | AWS | ECS + optional Bedrock | Deterministic scoring with optional LLM narrative enrichment |
 | Supervisor | On-Prem | NVIDIA B200/B300 | Gemini 2.5 Pro via NIM |
 | Email Agent | Azure | ACS | azure-communication-email |
 | Conversational | GCP | Dialogflow CX | Gemini fallback via Vertex AI |
+
+Google is the primary AI provider in this design through the Supervisor and Conversational flows, while AWS and Azure provide data and communication integrations required by the requested hybrid enterprise topology.
 
 ---
 
