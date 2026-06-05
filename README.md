@@ -41,6 +41,9 @@ This means the repository **does achieve** the core MAS shape:
 The repo is therefore best described as a **hybrid enterprise MAS with
 Google-led AI services**, not a fully Google-centric infrastructure stack.
 
+For C4 diagrams, data-flow walkthrough, state-machine reference, platform
+mapping, and security architecture see [architecture.md](architecture.md).
+
 ## Current Status
 
 This repository supports a distributed MAS runtime, where the on-prem
@@ -241,7 +244,7 @@ mas-enterprise/
 ├── docker-compose.yml
 ├── Dockerfile
 ├── .env.example
-└── ARCHITECTURE.md                 # Data flow diagrams and platform mapping
+└── architecture.md                 # Data flow diagrams and platform mapping
 ```
 
 ---
@@ -276,7 +279,7 @@ typed HTTP calls instead of importing every agent as an in-process function.
 
 This system uses **Keycloak** as the on-premises identity provider, replacing
 Microsoft Entra ID (Azure AD). Keycloak provides full OAuth 2.0/OIDC/SAML
-support without a cloud dependency. See [ARCHITECTURE.md](ARCHITECTURE.md)
+support without a cloud dependency. See [architecture.md](architecture.md)
 for the migration path.
 
 **Configuration:**
