@@ -6,155 +6,176 @@
 
 ```mermaid
 flowchart LR
-    user[Compliance Analyst / Client Application]
-    gateway[MAS Enterprise Gateway]
-    orchestrator[MAS Enterprise Orchestrator]
-    aws[(AWS Services)]
-    azure[(Azure Services)]
-    gcp[(Google Cloud Services)]
-    onprem[(On-Prem Platform)]
-    observe[(Observe)]
-    salesforce[(Salesforce)]
+    classDef person    fill:#08427b,stroke:#052e56,color:#fff
+    classDef internal  fill:#1168bd,stroke:#0b4884,color:#fff
+    classDef external  fill:#6b6b6b,stroke:#444,color:#fff
+    classDef datastore fill:#3d3d3d,stroke:#222,color:#fff
 
-    user -->|POST /analyse| gateway
-    gateway --> orchestrator
-    gateway -->|JWT validation| onprem
-    gateway -->|rate limiting| aws
-    orchestrator -->|invoke remote agent services| aws
-    orchestrator -->|invoke remote agent services| azure
-    orchestrator -->|invoke remote agent services| gcp
-    orchestrator -->|invoke remote agent services| onprem
-    orchestrator -->|structured telemetry| observe
-    gcp -->|case/activity logging| salesforce
+    analyst(["Compliance Analyst\n/ Client Application"]):::person
+
+    subgraph platform ["MAS Enterprise"]
+        direction LR
+        gateway["API Gateway\nFastAPI · AWS"]:::internal
+        orchestrator["Orchestrator\nLangGraph · On-Prem"]:::internal
+        gateway -->|"validated state"| orchestrator
+    end
+
+    subgraph remote ["Remote Agent Services"]
+        direction TB
+        aws["AWS\nDataFetcher · Analyst · DynamoDB"]:::external
+        azure["Azure\nEmail Agent · ACS"]:::external
+        gcp["GCP\nConversational Agent · Gemini"]:::external
+        onprem["On-Prem\nKeycloak · Vault · Supervisor"]:::external
+    end
+
+    observe[("Observe")]:::datastore
+    salesforce[("Salesforce")]:::datastore
+
+    analyst -->|"POST /analyse"| gateway
+    gateway -.->|"JWT validation"| onprem
+    orchestrator --> aws
+    orchestrator --> azure
+    orchestrator --> gcp
+    orchestrator --> onprem
+    orchestrator -->|"structured telemetry"| observe
+    gcp -->|"case / activity logging"| salesforce
 ```
 
 ### Level 2 — Container View
 
 ```mermaid
 flowchart TB
-    subgraph client[Client Boundary]
-        caller[Client / API Consumer]
+    classDef service   fill:#1168bd,stroke:#0b4884,color:#fff
+    classDef datastore fill:#3d3d3d,stroke:#222,color:#fff
+    classDef security  fill:#7b1fa2,stroke:#4a0072,color:#fff
+    classDef observe   fill:#1b5e20,stroke:#0d4a12,color:#fff
+
+    caller(["Client / API Consumer"])
+
+    subgraph aws_zone ["AWS"]
+        gateway["Gateway\nFastAPI"]:::service
+        data_fetcher["DataFetcher\nDeterministic"]:::service
+        analyst_svc["Analyst\nDeterministic + Bedrock"]:::service
+        redis[("Redis")]:::datastore
+        dynamodb[("DynamoDB")]:::datastore
     end
 
-    subgraph aws[AWS]
-        gateway[Gateway / Ingress\nFastAPI]
-        data_fetcher[DataFetcher Service\nDeterministic]
-        analyst[Analyst Service\nDeterministic + optional Bedrock]
-        redis[(Redis)]
-        dynamodb[(DynamoDB)]
+    subgraph onprem_zone ["On-Prem"]
+        orchestrator["Orchestrator\nLangGraph"]:::service
+        data_validator["DataValidator\nDeterministic"]:::service
+        supervisor_svc["Supervisor\nGemini 2.5 Pro"]:::service
+        policy["Policy Engine\nControl Tower"]:::security
+        keycloak["Keycloak"]:::security
+        vault["Vault"]:::security
     end
 
-    subgraph onprem[On-Prem]
-        orchestrator[Orchestrator\nLangGraph]
-        data_validator[DataValidator Service\nDeterministic]
-        supervisor[Supervisor Service\nGemini]
-        policy[Control Tower / Policy Engine]
-        keycloak[Keycloak]
-        vault[Vault / Key Management]
+    subgraph azure_zone ["Azure"]
+        email_svc["Email Agent"]:::service
+        acs[("Azure Comm. Services")]:::datastore
     end
 
-    subgraph azure[Azure]
-        email[Email Agent Service]
-        acs[(Azure Communication Services)]
+    subgraph gcp_zone ["GCP"]
+        conv_svc["Conversational Agent"]:::service
+        dialogflow[("Dialogflow CX")]:::datastore
+        gemini_v[("Gemini / Vertex AI")]:::datastore
+        sf[("Salesforce")]:::datastore
     end
 
-    subgraph gcp[GCP]
-        conversational[Conversational Agent Service]
-        dialogflow[(Dialogflow CX)]
-        gemini[(Gemini / Vertex AI)]
-        sf[(Salesforce)]
-    end
-
-    subgraph obs[Observability]
-        observe[(Observe)]
-        prometheus[(Prometheus / Grafana)]
+    subgraph obs_zone ["Observability"]
+        direction LR
+        observe[("Observe")]:::observe
+        prometheus[("Prometheus / Grafana")]:::observe
     end
 
     caller --> gateway
-    gateway -->|validated request state| orchestrator
+    gateway -->|"validated state"| orchestrator
     gateway --> redis
     gateway --> keycloak
     gateway --> policy
 
     orchestrator --> data_fetcher
     orchestrator --> data_validator
-    orchestrator --> analyst
-    orchestrator --> supervisor
-    orchestrator --> email
-    orchestrator --> conversational
+    orchestrator --> analyst_svc
+    orchestrator --> supervisor_svc
+    orchestrator --> email_svc
+    orchestrator --> conv_svc
     orchestrator --> policy
 
     data_fetcher --> dynamodb
-    analyst --> dynamodb
-    supervisor --> gemini
-    email --> acs
-    conversational --> dialogflow
-    conversational --> gemini
-    conversational --> sf
-
-    gateway --> observe
-    orchestrator --> observe
-    data_fetcher --> observe
-    data_validator --> observe
-    analyst --> observe
-    supervisor --> observe
-    email --> observe
-    conversational --> observe
-
-    gateway --> prometheus
-    orchestrator --> prometheus
+    analyst_svc --> dynamodb
+    supervisor_svc -->|"LLM calls"| gemini_v
     data_validator --> vault
-    supervisor --> vault
+    supervisor_svc --> vault
+    email_svc --> acs
+    conv_svc --> dialogflow
+    conv_svc --> gemini_v
+    conv_svc --> sf
+
+    %% All services emit structured logs → Observe; gateway + orchestrator → Prometheus
+    orchestrator -.->|"all services emit\ntraces & logs"| observe
+    gateway -.->|"metrics"| prometheus
+    orchestrator -.->|"metrics"| prometheus
 ```
 
 ### Level 3 — Orchestrator Component View
 
 ```mermaid
 flowchart TB
-    ingress[Gateway / Ingress]
+    classDef internal  fill:#1168bd,stroke:#0b4884,color:#fff
+    classDef state     fill:#0d47a1,stroke:#082f6a,color:#fff
+    classDef external  fill:#6b6b6b,stroke:#444,color:#fff
+    classDef policy    fill:#7b1fa2,stroke:#4a0072,color:#fff
+    classDef observe   fill:#1b5e20,stroke:#0d4a12,color:#fff
 
-    subgraph orchestrator_container[On-Prem Orchestrator Container]
-        state[MASState Store\nin-memory workflow state]
-        routes[Routing Functions]
-        prepolicy[Pre-Analysis Policy Gate]
-        postpolicy[Post-Analysis Policy Gate]
-        finalize[Finalize / Error Handler]
-        remote[Remote Agent Invoker\nHTTP + HMAC + retry]
+    ingress["Gateway / Ingress"]:::external
+
+    subgraph orch_container ["On-Prem Orchestrator"]
+        direction TB
+        state["MASState\nin-memory workflow state"]:::state
+        routes["Routing Functions"]:::internal
+        prepolicy["Pre-Analysis\nPolicy Gate"]:::policy
+        postpolicy["Post-Analysis\nPolicy Gate"]:::policy
+        finalize["Finalize /\nError Handler"]:::internal
+        remote["Remote Agent Invoker\nHTTP · HMAC · retry"]:::internal
     end
 
-    fetcher[DataFetcher Service]
-    validator[DataValidator Service]
-    analyst[Analyst Service]
-    supervisor[Supervisor Service]
-    email[Email Agent Service]
-    conv[Conversational Agent Service]
-    observe[Observe / Metrics]
+    subgraph remote_services ["Remote Agent Services"]
+        direction LR
+        fetcher["DataFetcher"]:::external
+        validator["DataValidator"]:::external
+        analyst_c["Analyst"]:::external
+        supervisor_c["Supervisor"]:::external
+        email_c["Email Agent"]:::external
+        conv_c["Conversational Agent"]:::external
+    end
+
+    observe_c[("Observe / Metrics")]:::observe
 
     ingress --> state
     state --> routes
-    routes --> remote
-    remote --> fetcher
-    remote --> validator
-    remote --> analyst
-    remote --> supervisor
-    remote --> email
-    remote --> conv
-
-    fetcher --> state
-    validator --> state
-    analyst --> state
-    supervisor --> state
-    email --> state
-    conv --> state
-
     state --> prepolicy
     state --> postpolicy
     state --> finalize
-
     prepolicy --> routes
     postpolicy --> routes
-    finalize --> observe
-    remote --> observe
+    routes --> remote
+
+    remote --> fetcher
+    remote --> validator
+    remote --> analyst_c
+    remote --> supervisor_c
+    remote --> email_c
+    remote --> conv_c
+
+    fetcher --> state
+    validator --> state
+    analyst_c --> state
+    supervisor_c --> state
+    email_c --> state
+    conv_c --> state
+
+    finalize --> observe_c
+    remote --> observe_c
 ```
 
 The C4 interpretation for this repo is:
