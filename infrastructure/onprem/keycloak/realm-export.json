@@ -1,0 +1,39 @@
+{
+  "realm": "mas",
+  "enabled": true,
+  "registrationAllowed": false,
+  "loginWithEmailAllowed": true,
+  "duplicateEmailsAllowed": false,
+  "resetPasswordAllowed": true,
+  "roles": {
+    "realm": [
+      {
+        "name": "mas:analyse",
+        "description": "Allows MAS analysis requests"
+      },
+      {
+        "name": "mas:read",
+        "description": "Allows MAS read access"
+      }
+    ]
+  },
+  "clients": [
+    {
+      "clientId": "mas-service-account",
+      "name": "MAS Service Account",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "bearerOnly": false,
+      "standardFlowEnabled": false,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": true,
+      "secret": "your-secret",
+      "defaultClientScopes": [
+        "profile",
+        "email",
+        "roles"
+      ]
+    }
+  ]
+}

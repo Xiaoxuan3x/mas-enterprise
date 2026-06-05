@@ -1,36 +1,56 @@
 version: "3.9"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# MAS Enterprise — Local Development Stack
+# MAS Enterprise — Distributed Local Stack
 #
 # Starts:
-#   - mas-gateway:     FastAPI gateway + LangGraph pipeline
-#   - dynamodb-local:  AWS DynamoDB local for DataFetcher testing
-#   - redis:           Rate limiter
-#   - keycloak:        On-prem identity provider (replaces Microsoft Entra ID)
-#   - prometheus:      Metrics scraper
-#   - grafana:         Metrics dashboard
+#   - mas-gateway:            on-prem orchestrator + ingress
+#   - data-fetcher:           AWS-aligned deterministic fetch service
+#   - data-validator:         on-prem validation service
+#   - analyst:                AWS-aligned analysis service
+#   - supervisor:             on-prem Gemini supervisor service
+#   - email-agent:            Azure email service
+#   - conversational-agent:   GCP conversational service
+#   - dynamodb-local / redis / keycloak / vault / prometheus / grafana
 # ─────────────────────────────────────────────────────────────────────────────
 
 services:
-
   mas-gateway:
     build:
       context: .
       dockerfile: Dockerfile
+    command:
+      [
+        "uvicorn",
+        "main:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8000",
+        "--log-config",
+        "/dev/null"
+      ]
     ports:
       - "8000:8000"
-      - "9090:9090"
     environment:
       ENV: development
       LOG_LEVEL: DEBUG
       LOG_FORMAT: console
+      AGENT_EXECUTION_MODE: remote
+      SERVICE_REQUEST_TIMEOUT_SECONDS: 60
+      INTER_SERVICE_HMAC_KEY: local-dev-shared-key
       AWS_REGION: us-east-1
       AWS_ACCESS_KEY_ID: localkey
       AWS_SECRET_ACCESS_KEY: localsecret
       DYNAMODB_ENDPOINT_URL: http://dynamodb-local:8000
       DYNAMODB_PROFILES_TABLE: mas-user-profiles
       DYNAMODB_TRANSACTIONS_TABLE: mas-transactions
+      DATA_FETCHER_URL: http://data-fetcher:8101/
+      DATA_VALIDATOR_URL: http://data-validator:8102/
+      ANALYST_URL: http://analyst:8103/
+      SUPERVISOR_URL: http://supervisor:8104/
+      EMAIL_AGENT_URL: http://email-agent:8105/
+      CONVERSATIONAL_AGENT_URL: http://conversational-agent:8106/
       REDIS_URL: redis://redis:6379
       KEYCLOAK_JWKS_URI: http://keycloak:8080/realms/mas/protocol/openid-connect/certs
       KEYCLOAK_TOKEN_URL: http://keycloak:8080/realms/mas/protocol/openid-connect/token
@@ -39,10 +59,199 @@ services:
       KMS_BACKEND: vault
       VAULT_ADDR: http://vault:8200
       VAULT_TOKEN: dev-root-token
+      CORS_ORIGINS: http://localhost:3000
     depends_on:
+      - data-fetcher
+      - data-validator
+      - analyst
+      - supervisor
+      - email-agent
+      - conversational-agent
       - dynamodb-local
       - redis
       - keycloak
+    volumes:
+      - .:/app
+    networks:
+      - mas-net
+
+  data-fetcher:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command:
+      [
+        "uvicorn",
+        "services.agent_apps:data_fetcher_app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8101",
+        "--log-config",
+        "/dev/null"
+      ]
+    ports:
+      - "8101:8101"
+    environment:
+      ENV: development
+      LOG_LEVEL: DEBUG
+      LOG_FORMAT: console
+      INTER_SERVICE_HMAC_KEY: local-dev-shared-key
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: localkey
+      AWS_SECRET_ACCESS_KEY: localsecret
+      DYNAMODB_ENDPOINT_URL: http://dynamodb-local:8000
+      DYNAMODB_PROFILES_TABLE: mas-user-profiles
+      DYNAMODB_TRANSACTIONS_TABLE: mas-transactions
+    depends_on:
+      - dynamodb-local
+    volumes:
+      - .:/app
+    networks:
+      - mas-net
+
+  data-validator:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command:
+      [
+        "uvicorn",
+        "services.agent_apps:data_validator_app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8102",
+        "--log-config",
+        "/dev/null"
+      ]
+    ports:
+      - "8102:8102"
+    environment:
+      ENV: development
+      LOG_LEVEL: DEBUG
+      LOG_FORMAT: console
+      INTER_SERVICE_HMAC_KEY: local-dev-shared-key
+    volumes:
+      - .:/app
+    networks:
+      - mas-net
+
+  analyst:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command:
+      [
+        "uvicorn",
+        "services.agent_apps:analyst_app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8103",
+        "--log-config",
+        "/dev/null"
+      ]
+    ports:
+      - "8103:8103"
+    environment:
+      ENV: development
+      LOG_LEVEL: DEBUG
+      LOG_FORMAT: console
+      INTER_SERVICE_HMAC_KEY: local-dev-shared-key
+      AWS_REGION: us-east-1
+      AWS_ACCESS_KEY_ID: localkey
+      AWS_SECRET_ACCESS_KEY: localsecret
+      ANALYST_USE_BEDROCK: "false"
+    volumes:
+      - .:/app
+    networks:
+      - mas-net
+
+  supervisor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command:
+      [
+        "uvicorn",
+        "services.agent_apps:supervisor_app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8104",
+        "--log-config",
+        "/dev/null"
+      ]
+    ports:
+      - "8104:8104"
+    environment:
+      ENV: development
+      LOG_LEVEL: DEBUG
+      LOG_FORMAT: console
+      INTER_SERVICE_HMAC_KEY: local-dev-shared-key
+      GEMINI_MODEL_ID: gemini-2.5-pro
+      GEMINI_API_KEY: local-dev-key
+    volumes:
+      - .:/app
+    networks:
+      - mas-net
+
+  email-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command:
+      [
+        "uvicorn",
+        "services.agent_apps:email_agent_app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8105",
+        "--log-config",
+        "/dev/null"
+      ]
+    ports:
+      - "8105:8105"
+    environment:
+      ENV: development
+      LOG_LEVEL: DEBUG
+      LOG_FORMAT: console
+      INTER_SERVICE_HMAC_KEY: local-dev-shared-key
+      AZURE_COMMUNICATION_CONNECTION_STRING: endpoint=https://local;accesskey=dev
+      AZURE_EMAIL_SENDER: no-reply@mas-enterprise.local
+    volumes:
+      - .:/app
+    networks:
+      - mas-net
+
+  conversational-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command:
+      [
+        "uvicorn",
+        "services.agent_apps:conversational_agent_app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8106",
+        "--log-config",
+        "/dev/null"
+      ]
+    ports:
+      - "8106:8106"
+    environment:
+      ENV: development
+      LOG_LEVEL: DEBUG
+      LOG_FORMAT: console
+      INTER_SERVICE_HMAC_KEY: local-dev-shared-key
+      GCP_PROJECT_ID: mas-dev
+      DIALOGFLOW_LOCATION: us-central1
+      DIALOGFLOW_AGENT_ID: local-agent
+      GEMINI_API_KEY: local-dev-key
     volumes:
       - .:/app
     networks:
@@ -72,7 +281,7 @@ services:
     ports:
       - "8080:8080"
     volumes:
-      - ./infra/keycloak/realm-export.json:/opt/keycloak/data/import/realm-export.json
+      - ./infrastructure/onprem/keycloak/realm-export.json:/opt/keycloak/data/import/realm-export.json
     networks:
       - mas-net
 
@@ -93,7 +302,7 @@ services:
     ports:
       - "9091:9090"
     volumes:
-      - ./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./infrastructure/onprem/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
     networks:
       - mas-net
 

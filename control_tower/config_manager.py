@@ -39,6 +39,12 @@ class Settings(BaseSettings):
     env: str = Field(default="production", description="Deployment environment")
     log_level: str = Field(default="INFO")
     log_format: str = Field(default="json")
+    agent_execution_mode: str = Field(
+        default="remote",
+        description="How the orchestrator invokes agents: local or remote.",
+    )
+    service_request_timeout_seconds: float = Field(default=60.0)
+    inter_service_hmac_key: Optional[str] = Field(default=None)
 
     # ── On-prem GPU / model serving ───────────────────────────────────────
     gemini_model_id: str = Field(default="gemini-2.5-pro")
@@ -61,6 +67,14 @@ class Settings(BaseSettings):
     azure_email_sender: str = Field(
         default="DoNotReply@notifications.mas-enterprise.com"
     )
+
+    # ── Remote agent service endpoints ────────────────────────────────────
+    data_fetcher_url: str = Field(default="http://localhost:8101/")
+    data_validator_url: str = Field(default="http://localhost:8102/")
+    analyst_url: str = Field(default="http://localhost:8103/")
+    supervisor_url: str = Field(default="http://localhost:8104/")
+    email_agent_url: str = Field(default="http://localhost:8105/")
+    conversational_agent_url: str = Field(default="http://localhost:8106/")
 
     # ── GCP ───────────────────────────────────────────────────────────────
     gcp_project_id: Optional[str] = Field(default=None)

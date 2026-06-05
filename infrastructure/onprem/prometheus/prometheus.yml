@@ -1,0 +1,20 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: mas-gateway
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["mas-gateway:8000"]
+
+  - job_name: agent-services-health
+    metrics_path: /health
+    static_configs:
+      - targets:
+          - "data-fetcher:8101"
+          - "data-validator:8102"
+          - "analyst:8103"
+          - "supervisor:8104"
+          - "email-agent:8105"
+          - "conversational-agent:8106"

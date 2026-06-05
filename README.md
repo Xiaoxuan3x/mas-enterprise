@@ -13,15 +13,13 @@ primary **non-deterministic LLM-backed supervisor**.
 Client Request
   -> Gateway / Ingress
   -> On-Prem Orchestrator
-  -> Deterministic Agents
-     - DataFetcher
-     - DataValidator
-     - Analyst
-  -> Non-Deterministic Agent
-     - Supervisor (Gemini-backed)
-  -> Optional Sidecar Agents
-     - Email Agent
-     - Conversational Agent
+  -> Remote Agent Services
+     - DataFetcher Service (AWS-aligned)
+     - DataValidator Service (On-Prem)
+     - Analyst Service (AWS-aligned)
+     - Supervisor Service (On-Prem Gemini)
+     - Email Agent Service (Azure)
+     - Conversational Agent Service (GCP)
   -> Final Response
 ```
 
@@ -42,6 +40,33 @@ This means the repository **does achieve** the core MAS shape:
 
 The repo is therefore best described as a **hybrid enterprise MAS with
 Google-led AI services**, not a fully Google-centric infrastructure stack.
+
+## Current Status
+
+This repository supports a distributed MAS runtime, where the on-prem
+orchestrator invokes independently deployable agent services over HTTP.
+
+What is implemented here:
+
+- application code for the gateway, orchestrator, and remote agent services
+- local distributed execution via `docker compose`
+- typed service contracts, retries, guardrails, and observability hooks
+
+What is not implemented here yet:
+
+- live AWS, Azure, and GCP infrastructure provisioning
+- production networking and private connectivity
+- production compute, deployment automation, and service discovery
+- production IAM, secret management, and cross-cloud runtime configuration
+
+Production rollout still requires real infrastructure-as-code under
+[infrastructure/](/Users/trix/dev/mas-enterprise/infrastructure) for:
+
+- networking and service connectivity
+- compute and runtime environments
+- identity and access control
+- secret and key management
+- monitoring, alerting, and deployment automation
 
 ## Requirement Coverage
 
@@ -88,18 +113,28 @@ cp .env.example .env
 # Edit .env with your credentials
 ```
 
-### 4. Start local infrastructure
+### 4. Start the distributed local stack
 
 ```bash
-docker-compose up -d dynamodb-local redis keycloak vault
+docker compose up --build
 ```
 
-### 5. Run the gateway
+This starts:
+
+- the on-prem gateway/orchestrator
+- six remote agent services
+- DynamoDB Local, Redis, Keycloak, Vault, Prometheus, and Grafana
+
+### 5. Run the services manually instead of Docker (optional)
 
 ```bash
-python main.py
-# or
-uvicorn gateway.ingress:app --reload --port 8000
+uvicorn services.agent_apps:data_fetcher_app --reload --port 8101
+uvicorn services.agent_apps:data_validator_app --reload --port 8102
+uvicorn services.agent_apps:analyst_app --reload --port 8103
+uvicorn services.agent_apps:supervisor_app --reload --port 8104
+uvicorn services.agent_apps:email_agent_app --reload --port 8105
+uvicorn services.agent_apps:conversational_agent_app --reload --port 8106
+uvicorn main:app --reload --port 8000
 ```
 
 ### 6. Send a test request
@@ -136,10 +171,11 @@ pytest tests/ -v
 pytest tests/ -v --cov=. --cov-report=term-missing
 ```
 
-These tests are mostly mocked:
+These tests are mostly mocked at the cloud SDK layer:
 
 - no real DynamoDB, Gemini, or Azure calls are required
-- the suite validates your pipeline logic and guardrail behavior, not live cloud services
+- the suite validates pipeline logic, remote service contracts, and guardrail behavior
+- the distributed workflow test is skipped automatically when `langgraph` is not installed
 
 ---
 
@@ -150,7 +186,8 @@ mas-enterprise/
 ├── main.py                         # Application entry point
 ├── schemas/
 │   ├── state.py                    # LangGraph MASState TypedDict + initial_state()
-│   └── agent_io.py                 # All Pydantic I/O models for every agent boundary
+│   ├── agent_io.py                 # All Pydantic I/O models for every agent boundary
+│   └── distributed_io.py           # HTTP transport contracts for remote agent services
 ├── agents/
 │   ├── orchestrator.py             # Central coordinator, routing functions, finalize
 │   ├── data_fetcher.py             # AWS DynamoDB data retrieval (Deterministic A)
@@ -163,18 +200,27 @@ mas-enterprise/
 ├── core/
 │   ├── logging_config.py           # structlog JSON structured logging
 │   ├── retry.py                    # Tenacity exponential backoff decorators
+│   ├── remote_agent.py             # HTTP client wrapper for remote agent services
 │   ├── guardrails.py               # LLM output validation and forbidden token scan
 │   └── security.py                 # JWT/mTLS/HMAC zero-trust utilities
 ├── graph/
-│   └── workflow.py                 # LangGraph StateGraph definition + build_workflow()
+│   └── workflow.py                 # LangGraph graph with remote/local agent execution modes
 ├── gateway/
 │   ├── ingress.py                  # FastAPI gateway (JWT, rate limit, injection guard)
 │   ├── prompt_injection_guard.py   # Regex-based injection pattern scanner
 │   └── pii_obfuscator.py           # PII scrubbing and user ID tokenisation
+├── services/
+│   ├── runtime.py                  # Shared FastAPI runtime for each remote agent
+│   └── agent_apps.py               # Deployable ASGI apps for all agent services
 ├── security/
 │   ├── key_management.py           # AWS KMS + HashiCorp Vault unified KMS client
 │   ├── tokenization.py             # Format-preserving PAN/email/user-ID tokenisation
 │   └── identity.py                 # Keycloak service account token management
+├── infrastructure/
+│   ├── README.md                   # Deployment asset layout
+│   └── onprem/
+│       ├── keycloak/realm-export.json
+│       └── prometheus/prometheus.yml
 ├── observability/
 │   ├── observe_client.py           # Observe HTTP ingest event shipping
 │   └── metrics.py                  # Prometheus counters and histograms
@@ -185,6 +231,7 @@ mas-enterprise/
 │   └── salesforce_client.py        # Salesforce CRM case + activity logging
 ├── tests/
 │   ├── conftest.py                 # Shared fixtures (state, models, mock factories)
+│   ├── test_distributed_workflow.py# Remote service orchestration test
 │   ├── test_e2e_success.py         # End-to-end happy path + invalid-data path
 │   ├── test_supervisor_failure.py  # Supervisor failure modes + guardrail unit tests
 │   └── test_data_validator.py      # DataValidator rule engine unit tests
@@ -212,6 +259,16 @@ mas-enterprise/
 | Conversational | GCP | Dialogflow CX | Gemini fallback via Vertex AI |
 
 Google is the primary AI provider in this design through the Supervisor and Conversational flows, while AWS and Azure provide data and communication integrations required by the requested hybrid enterprise topology.
+
+## Distributed Execution
+
+The orchestrator now owns the central MAS state and invokes the agent layer via
+typed HTTP calls instead of importing every agent as an in-process function.
+
+- `graph/workflow.py` defaults to `AGENT_EXECUTION_MODE=remote`
+- each remote service accepts a validated `StateSnapshot` and returns a validated `StatePatch`
+- inter-service requests can be signed with `INTER_SERVICE_HMAC_KEY`
+- `build_workflow(execution_mode="local")` remains available for low-friction debugging
 
 ---
 
